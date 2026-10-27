@@ -40,5 +40,12 @@
     "analyses": "data/analyses",
     "outbox": "data/outbox",
     "logs": "logs"
+  },
+  "publish": {
+    "enabled": true,
+    "target": "github",
+    "repo_dir": "",
+    "upload_media": false,
+    "push": true
   }
 }

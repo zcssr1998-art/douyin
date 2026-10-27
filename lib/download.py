@@ -96,11 +96,26 @@ def _valid_mp4(p: Path) -> bool:
 
 def download(aweme_id: str, out_dir: Path, bind: str = "", budget_ms: int = 20000,
              force: bool = False) -> dict:
+    """优先下 DASH 音频轨（转写只要语音），失败再回退老的整段 mp4 路径。"""
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 首选路径：CDP 监听网络事件抓 media-audio-und-mp4a 音轨（约视频体积的 1/40）。
+    # 2026-10-27 起详情页改成 MSE + blob: 播放，HTML 里已经没有任何播放地址，老路径多数会失败。
+    audio_err = ""
+    try:
+        from grab import fetch_audio
+
+        ga = fetch_audio(aweme_id, out_dir, bind=bind, wait_ms=budget_ms, force=force)
+        if ga.get("ok"):
+            return ga
+        audio_err = ga.get("error") or "音频轨抓取失败"
+    except Exception as exc:  # noqa: BLE001
+        audio_err = f"音频轨异常 {type(exc).__name__}: {exc}"
+
     dst = out_dir / f"{aweme_id}.mp4"
     if not force and _valid_mp4(dst):
         return {"ok": True, "aweme_id": aweme_id, "path": str(dst),
-                "bytes": dst.stat().st_size, "cached": True}
+                "bytes": dst.stat().st_size, "cached": True, "kind": "video"}
 
     page = dump_dom(f"https://www.douyin.com/video/{aweme_id}", budget_ms=budget_ms)
     if len(page) < 20_000:
@@ -109,7 +124,8 @@ def download(aweme_id: str, out_dir: Path, bind: str = "", budget_ms: int = 2000
     urls = extract_play_urls(page)
     if not urls:
         return {"ok": False, "aweme_id": aweme_id,
-                "error": "详情页未找到 aweme/v1/play 播放地址（可能需登录或页面结构变更）",
+                "error": f"详情页未找到 aweme/v1/play 播放地址（音频轨也失败：{audio_err}）",
+                "audio_error": audio_err,
                 "page_bytes": len(page)}
 
     errors: list[str] = []
@@ -141,7 +157,8 @@ def download(aweme_id: str, out_dir: Path, bind: str = "", budget_ms: int = 2000
                 errors.append(f"{type(exc).__name__}: {exc} bind={bind_addr or 'auto'}")
             finally:
                 sess.close()
-    return {"ok": False, "aweme_id": aweme_id, "error": "全部播放地址失败", "errors": errors[:5]}
+    return {"ok": False, "aweme_id": aweme_id, "error": "全部播放地址失败",
+            "audio_error": audio_err, "errors": errors[:5]}
 
 
 def main() -> int:

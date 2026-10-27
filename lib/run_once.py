@@ -1,7 +1,7 @@
 """抖音博主监控 · 单次执行入口（由 Windows 计划任务每 N 分钟调用一次）。
 
 职责：拉作品列表 → 用 aweme_id 集合差集识别新作品 → 按阶段推进
-      下载 → 转写 → DeepSeek 分析 → Discord 推送
+      下载 → 转写 → DeepSeek 分析 → 发布到 GitHub 仓库（posts/ 下 markdown + 音频存档）
 并把每一步的结果原子写入 data/state.json，进程被杀/重启后从断点继续。
 
 用法:
@@ -217,8 +217,14 @@ def advance(item: dict, cfg: dict) -> dict:
     pc = cfg["paths"]
 
     media_dir = ROOT / cfg["download"]["dir"]
-    media_file = media_dir / f"{aweme_id}.mp4"
-    if stage == "discovered" and media_file.exists() and media_file.stat().st_size > 100_000:
+    # 媒体产物可能有两种：.m4a（CDP 抓的 DASH 音频轨，首选）或 .mp4（老的整段视频回退路径）
+    media_file = None
+    for ext in (".m4a", ".mp4"):
+        cand = media_dir / f"{aweme_id}{ext}"
+        if cand.exists() and cand.stat().st_size > 100_000:
+            media_file = cand
+            break
+    if stage == "discovered" and media_file is not None:
         return {**item, "stage": "downloaded", "media": str(media_file),
                 "media_bytes": media_file.stat().st_size, "last_error": None}
 
@@ -279,6 +285,32 @@ def advance(item: dict, cfg: dict) -> dict:
         pfile = ROOT / pc["outbox"] / f"{aweme_id}.payload.json"
         pfile.parent.mkdir(parents=True, exist_ok=True)
         pfile.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+
+        pub = cfg.get("publish") or {}
+        target = (pub.get("target") or "github").lower()
+
+        # 主路径：发布到 GitHub 仓库（markdown + 逐字稿 + 音频存档）
+        if target == "github" and pub.get("enabled", True):
+            argv = [str(LIB / "publish_github.py"), "--payload", str(pfile)]
+            if item.get("media"):
+                argv += ["--media", item["media"]]
+            if item.get("transcript"):
+                argv += ["--transcript", item["transcript"]]
+            if pub.get("repo_dir"):
+                argv += ["--repo-dir", str(pub["repo_dir"])]
+            if pub.get("push") is False:
+                argv += ["--no-push"]
+            if pub.get("upload_media") is False:
+                argv += ["--no-media"]
+            res, _ = run_module(argv, timeout=900)
+            if not res.get("ok"):
+                return {**item, "last_error": f"publish: {res.get('error')}",
+                        "attempts": item.get("attempts", 0) + 1}
+            return {**item, "stage": "notified", "notified_at": now_iso(),
+                    "published_url": res.get("url"), "commit": res.get("commit"),
+                    "publish_note": res.get("note"), "last_error": None}
+
+        # 备选路径：老的 Discord webhook
         argv = [str(LIB / "notify.py"), "--payload", str(pfile)]
         res, _ = run_module(argv, timeout=600)
         if not res.get("ok"):
@@ -355,7 +387,9 @@ def _main_locked(a, cfg) -> int:
     if not a.no_fetch:
         import fetch_feed  # noqa: E402
         try:
-            feed = fetch_feed.fetch(cfg["user"]["sec_uid"], budget_ms=cfg["fetch"].get("budget_ms", 25000))
+            feed = fetch_feed.fetch(cfg["user"]["sec_uid"],
+                                    budget_ms=cfg["fetch"].get("budget_ms", 25000),
+                                    expect_nickname=(cfg.get("user") or {}).get("nickname", ""))
         except Exception as exc:  # noqa: BLE001
             feed = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         summary["feed"] = {"ok": feed.get("ok"), "count": feed.get("count"), "error": feed.get("error")}

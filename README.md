@@ -3,17 +3,20 @@
 监控 [https://v.douyin.com/HRqWY-OM5PI/](https://v.douyin.com/HRqWY-OM5PI/)
 （真实昵称：**艾丽的无废话财经**，抖音号 606890417，sec_uid `MS4wLjABAAAA_hkYGrUP3d2i3JodCLwrplan05tJ9xl1D6lZySbNC0Q`）
 
-每 3 分钟检查一次新作品 → 下载音频 → 本地语音转文字 → DeepSeek 出观点分析 → 发到 Discord。
+每 3 分钟检查一次新作品 → 抓音频 → 本地语音转文字 → DeepSeek 出观点分析 → **写成 markdown 提交进本仓库 `posts/` 目录并 push**。
+
+推到这里而不是聊天软件，是因为这个博主有时视频上线没多久就被下架：仓库里的逐字稿是下架后的唯一存档。
 
 ## 这条链路是怎么跑的
 
 | 环节 | 文件 | 干什么 |
 |---|---|---|
 | 取作品列表 | `lib/fetch_feed.py` | 用无头 Chrome（后台静默浏览器）打开博主主页，从网页里抠出作品 ID 和标题 |
-| 下载音频 | `lib/download.py` | 打开视频详情页，取出可直连的 mp4 地址，多线程无关的普通下载 |
+| 抓音频 | `lib/grab.py` | 用后台浏览器的网络事件监听抓 DASH 音频轨（约 1MB/条，是整段视频的 1/40），`download.py` 首选它、失败才回退整段 mp4 |
 | 语音转文字 | `lib/transcribe.py` | 本地 faster-whisper（small 模型，CPU），不联网、不上传 |
 | 观点分析 | `lib/analyze.py` | 调本机 8769 端口的 DeepSeek 中转，出五段结构化分析 |
-| 发 Discord | `lib/notify.py` | Webhook 或 Bot 发送，超 2000 字自动分段 |
+| 发布 | `lib/publish_github.py` | 写 `posts/<日期>-<ID>-<标题>.md` + 重建索引 + git commit + push |
+| （备选）发 Discord | `lib/notify.py` | Webhook 或 Bot 发送，超 2000 字自动分段；`publish.target` 设成 discord 才走 |
 | 串起来 + 记状态 | `lib/run_once.py` | 单次执行的状态机，每步落盘 `data/state.json` |
 
 ## 定时怎么跑的
@@ -48,7 +51,23 @@ python lib/run_once.py --no-fetch      # 不拉列表，只推进没做完的作
 python lib/run_once.py --simulate-new <aweme_id>   # 把指定作品当新的跑一遍全链
 ```
 
-## Discord 凭据（当前**未配置**，所以只落盘不发）
+## 发布到 GitHub（当前生效的方式）
+
+`config.json` 的 `publish` 段：
+
+| 键 | 含义 |
+|---|---|
+| `enabled` | 总开关 |
+| `target` | `github`（默认）或 `discord` |
+| `repo_dir` | 仓库路径，留空表示本项目根目录 |
+| `push` | `false` 时只 commit 不 push（调试用） |
+| `upload_media` | `true` 时把音频也提交进仓库；默认 `false`，只存逐字稿（一条音频 1~16MB，长期会把仓库撑大） |
+
+push 用的是本机已登录的 `gh` 凭据（token 在系统 keyring 里，不写文件）。若 `gh` 没登录，push 会失败但 **commit 已经落地**，下一轮重试会把它推上去，内容不会丢。
+
+**为什么不直接用 git 默认的凭据助手**：本机默认是 Git Credential Manager，无人值守时会挂在弹窗上不返回，定时任务会一直卡住。
+
+## Discord 凭据（备选，当前**未启用**）
 
 二选一，写进环境变量或 `config.json` 的 `discord` 段：
 
@@ -90,11 +109,16 @@ douyin-monitor/
 ├─ run_once.bat          计划任务的入口（纯 ASCII，靠 %LOCALAPPDATA% 找 pythonw）
 ├─ lib/
 │  ├─ fetch_feed.py      取作品列表（无头 Chrome 渲染主页）
-│  ├─ download.py        下载视频并抽出音轨
+│  ├─ download.py        取音频（首选 grab 的音频轨，回退整段 mp4）
+│  ├─ grab.py            CDP 监听网络事件抓 DASH 音频轨
+│  ├─ local_proxy.py     指定网卡出站的极简 CONNECT 代理（让抖音走家宽）
 │  ├─ transcribe.py      本地语音转文字
 │  ├─ analyze.py         调 DeepSeek 出五段分析
-│  ├─ notify.py          发 Discord（Webhook 或 Bot，>2000 字自动分段）
+│  ├─ notify.py          发 Discord（Webhook 或 Bot，>2000 字自动分段；备选路径）
+│  ├─ publish_github.py  写 posts/ markdown + 提交 + push
 │  └─ run_once.py        串起全链 + 状态机（唯一入口）
+├─ posts/                发布产物（入库）：每条视频一个 markdown + README 索引
+├─ tools/                CDP 调试脚本（抓 DOM / 抓流 / 导 cookie）
 ├─ data/                 运行态，不入库：state.json / media / transcripts / analyses / outbox / chrome-profile
 └─ logs/                 日志，不入库
 ```
