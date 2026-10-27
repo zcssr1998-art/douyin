@@ -1,0 +1,44 @@
+{
+  "_comment": "复制本文件为 config.json 再改。真实 config.json 含凭据与本机绝对路径，已被 .gitignore 排除，绝不入库。",
+  "user": {
+    "sec_uid": "MS4wLjABAAAA_hkYGrUP3d2i3JodCLwrplan05tJ9xl1D6lZySbNC0Q",
+    "nickname": "艾丽的无废话财经",
+    "douyin_id": "606890417",
+    "short_url": "https://v.douyin.com/HRqWY-OM5PI/",
+    "profile_url": "https://www.douyin.com/user/MS4wLjABAAAA_hkYGrUP3d2i3JodCLwrplan05tJ9xl1D6lZySbNC0Q"
+  },
+  "poll": {
+    "interval_minutes": 3,
+    "max_attempts_per_item": 5,
+    "max_items_per_run": 3
+  },
+  "fetch": {
+    "budget_ms": 25000,
+    "chrome_profile": "data/chrome-profile"
+  },
+  "download": {
+    "dir": "data/media",
+    "bind_source_address": ""
+  },
+  "asr": {
+    "model_dir": "<whisper 模型目录，CTranslate2 格式（含 model.bin / config.json / tokenizer.json）>",
+    "language": "zh"
+  },
+  "analyze": {
+    "base_url": "http://127.0.0.1:8769/v1",
+    "model": "<你的 DeepSeek 模型 id>",
+    "api_key": ""
+  },
+  "discord": {
+    "webhook_url": "",
+    "channel_id": "",
+    "proxy": ""
+  },
+  "paths": {
+    "state": "data/state.json",
+    "transcripts": "data/transcripts",
+    "analyses": "data/analyses",
+    "outbox": "data/outbox",
+    "logs": "logs"
+  }
+}

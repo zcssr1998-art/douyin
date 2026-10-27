@@ -1,0 +1,26 @@
+# 抖音博主监控（艾丽的无废话财经）· .gitignore
+# 凭据与运行态数据一律不入库
+
+# 真实配置：含 webhook / token / 本机绝对路径，只用 config.example.json 当模板
+config.json
+config.local.json
+
+# 运行态数据与日志（作品列表、逐字稿、分析结果、发件箱、浏览器配置目录）
+data/
+logs/
+
+# 视频与临时文件
+*.mp4
+*.part
+*.wav
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 系统杂项
+.DS_Store
+Thumbs.db
