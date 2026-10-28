@@ -47,7 +47,7 @@ def _ensure_streams() -> None:
 
 _ensure_streams()
 
-STAGES = ["discovered", "downloaded", "transcribed", "analyzed", "notified"]
+STAGES = ["discovered", "downloaded", "transcribed", "analyzed", "unsupported", "notified"]
 LOCK_NAME = ".run_once.lock"
 LOCK_STALE_SEC = 1800
 
@@ -206,9 +206,9 @@ def run_module(argv: list[str], timeout: int = 1800) -> tuple[dict, int]:
 def notify_payload(item: dict, analysis: dict) -> dict:
     # analyze.py 把五段放在 analysis.analysis 子对象里（顶层还有 ok/model/usage/raw），
     # 这里要下钻一层，否则推出去全是空字段。
-    body = analysis.get("analysis")
+    body = analysis.get("analysis") if isinstance(analysis, dict) else None
     if not isinstance(body, dict):
-        body = analysis
+        body = analysis if isinstance(analysis, dict) else {}
     return {
         "aweme_id": item["aweme_id"],
         "nickname": item.get("nickname") or "",
@@ -257,6 +257,13 @@ def advance(item: dict, cfg: dict) -> dict:
             argv += ["--bind", cfg["download"]["bind_source_address"]]
         res, _ = run_module(argv, timeout=600)
         if not res.get("ok"):
+            if res.get("drm"):
+                # DRM 加密：本地转写在物理上做不到，但存档时机比分析更重要
+                # ——作者可能随时删片。判定完同轮就把存档页发出去，不等下一轮。
+                marked = {**item, "stage": "unsupported", "drm": True,
+                          "last_error": f"drm: {res.get('error')}",
+                          "attempts": item.get("attempts", 0)}
+                return _publish(marked, cfg, None, pc)
             return {**item, "last_error": f"download: {res.get('error')}", "attempts": item.get("attempts", 0) + 1}
         title = item.get("title") or res.get("title") or ""
         return {**item, "stage": "downloaded", "media": res["path"], "media_bytes": res.get("bytes"),
@@ -296,55 +303,67 @@ def advance(item: dict, cfg: dict) -> dict:
     if stage == "analyzed":
         with open(item["analysis"], encoding="utf-8") as fh:
             analysis = json.load(fh)
-        payload = notify_payload(item, analysis)
-        pfile = ROOT / pc["outbox"] / f"{aweme_id}.payload.json"
-        pfile.parent.mkdir(parents=True, exist_ok=True)
-        pfile.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        return _publish(item, cfg, analysis, pc)
 
-        pub = cfg.get("publish") or {}
-        target = (pub.get("target") or "github").lower()
-
-        # 主路径：发布到 GitHub 仓库（markdown + 逐字稿 + 音频存档）
-        if target == "github" and pub.get("enabled", True):
-            argv = [str(LIB / "publish_github.py"), "--payload", str(pfile)]
-            if item.get("media"):
-                argv += ["--media", item["media"]]
-            if item.get("transcript"):
-                argv += ["--transcript", item["transcript"]]
-            if item.get("nickname"):
-                argv += ["--author", item["nickname"]]
-            if item.get("profile_url"):
-                argv += ["--profile-url", item["profile_url"]]
-            if pub.get("repo_dir"):
-                argv += ["--repo-dir", str(pub["repo_dir"])]
-            if pub.get("push") is False:
-                argv += ["--no-push"]
-            if pub.get("upload_media") is False:
-                argv += ["--no-media"]
-            res, _ = run_module(argv, timeout=900)
-            if not res.get("ok"):
-                return {**item, "last_error": f"publish: {res.get('error')}",
-                        "attempts": item.get("attempts", 0) + 1}
-            return {**item, "stage": "notified", "notified_at": now_iso(),
-                    "published_url": res.get("url"), "commit": res.get("commit"),
-                    "publish_note": res.get("note"), "last_error": None}
-
-        # 备选路径：老的 Discord webhook
-        argv = [str(LIB / "notify.py"), "--payload", str(pfile)]
-        res, _ = run_module(argv, timeout=600)
-        if not res.get("ok"):
-            return {**item, "last_error": f"notify: {res.get('error') or res.get('http_status')}",
-                    "attempts": item.get("attempts", 0) + 1}
-        if res.get("dry_run"):
-            # dry-run 不算"已送达"：保留 analyzed 阶段，凭据到位后自动补发。
-            # 不累加 attempts —— 缺凭据是配置问题，不该把作品判成 failed。
-            return {**item, "stage": "analyzed", "dry_run": True,
-                    "last_error": "dry_run: 缺 Discord 凭据，仅落盘 outbox",
-                    "attempts": item.get("attempts", 0)}
-        return {**item, "stage": "notified", "notified_at": now_iso(),
-                "message_ids": res.get("message_ids"), "chunks": res.get("chunks"), "last_error": None}
+    # DRM 加密的作品：音频解不出来，但不该丢掉存档时机（作者随时可能删片）。
+    # 这里仍然发一条只有标题/时间/链接的存档页，逐字稿段落写明加密原因。
+    if stage == "unsupported" and item.get("drm"):
+        return _publish(item, cfg, None, pc)
 
     return item
+
+
+def _publish(item: dict, cfg: dict, analysis, pc: dict) -> dict:
+    """把一条作品发布出去：GitHub markdown 为主路径，Discord webhook 为备选。"""
+    aweme_id = item["aweme_id"]
+    payload = notify_payload(item, analysis)
+    pfile = ROOT / pc["outbox"] / f"{aweme_id}.payload.json"
+    pfile.parent.mkdir(parents=True, exist_ok=True)
+    pfile.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    pub = cfg.get("publish") or {}
+    target = (pub.get("target") or "github").lower()
+
+    # 主路径：发布到 GitHub 仓库（markdown + 逐字稿 + 音频存档）
+    if target == "github" and pub.get("enabled", True):
+        argv = [str(LIB / "publish_github.py"), "--payload", str(pfile)]
+        if item.get("media"):
+            argv += ["--media", item["media"]]
+        if item.get("transcript"):
+            argv += ["--transcript", item["transcript"]]
+        if item.get("nickname"):
+            argv += ["--author", item["nickname"]]
+        if item.get("profile_url"):
+            argv += ["--profile-url", item["profile_url"]]
+        if pub.get("repo_dir"):
+            argv += ["--repo-dir", str(pub["repo_dir"])]
+        if pub.get("push") is False:
+            argv += ["--no-push"]
+        if pub.get("upload_media") is False:
+            argv += ["--no-media"]
+        res, _ = run_module(argv, timeout=900)
+        if not res.get("ok"):
+            return {**item, "last_error": f"publish: {res.get('error')}",
+                    "attempts": item.get("attempts", 0) + 1}
+        return {**item, "stage": "notified", "notified_at": now_iso(),
+                "published_url": res.get("url"), "commit": res.get("commit"),
+                "publish_note": res.get("note"), "last_error": None}
+
+    # 备选路径：老的 Discord webhook
+    argv = [str(LIB / "notify.py"), "--payload", str(pfile)]
+    res, _ = run_module(argv, timeout=600)
+    if not res.get("ok"):
+        return {**item, "last_error": f"notify: {res.get('error') or res.get('http_status')}",
+                "attempts": item.get("attempts", 0) + 1}
+    if res.get("dry_run"):
+        # dry-run 不算"已送达"：保留原阶段，凭据到位后自动补发。
+        # 不累加 attempts —— 缺凭据是配置问题，不该把作品判成 failed。
+        keep = "unsupported" if item.get("drm") else "analyzed"
+        return {**item, "stage": keep, "dry_run": True,
+                "last_error": "dry_run: 缺 Discord 凭据，仅落盘 outbox",
+                "attempts": item.get("attempts", 0)}
+    return {**item, "stage": "notified", "notified_at": now_iso(),
+            "message_ids": res.get("message_ids"), "chunks": res.get("chunks"), "last_error": None}
 
 
 def build_item(raw: dict, cfg: dict, user: dict | None = None) -> dict:
@@ -487,7 +506,7 @@ def _run_user(a, cfg: dict, user: dict, summary: dict) -> int:
     # ---- 3) 推进未完成阶段 ----
     max_items = a.max_items or cfg["poll"].get("max_items_per_run", 3)
     max_attempts = cfg["poll"].get("max_attempts_per_item", 5)
-    todo = [it for it in items.values() if it.get("stage") in ("discovered", "downloaded", "transcribed", "analyzed")]
+    todo = [it for it in items.values() if it.get("stage") in ("discovered", "downloaded", "transcribed", "analyzed", "unsupported")]
     todo.sort(key=lambda it: (0 if it.get("simulated") else 1, it.get("ts") or 0))
     pending_left = 0
     done = 0

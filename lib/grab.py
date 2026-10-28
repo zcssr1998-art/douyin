@@ -77,10 +77,9 @@ def grab_streams(aweme_id: str, wait_ms: int = 18000, port: int | None = None) -
     if port is None:
         proc, port = launch_chrome(profile)
     try:
-        if fetch_feed.COOKIE_FILE.exists():
-            pass  # cookie 由 cdp_grab 之外注入：见下方 _inject 调用
+        ck = str(fetch_feed.COOKIE_FILE) if fetch_feed.COOKIE_FILE.exists() else ""
         cp = subprocess.run(
-            [node, str(ROOT / "tools" / "cdp_grab.js"), str(port), url, str(wait_ms)],
+            [node, str(ROOT / "tools" / "cdp_grab.js"), str(port), url, str(wait_ms), ck],
             capture_output=True, text=True, timeout=180, encoding="utf-8", errors="replace")
         out = (cp.stdout or "").strip().splitlines()
         last = out[-1] if out else ""
@@ -121,6 +120,22 @@ def _session(bind: str = "") -> requests.Session:
     return s
 
 
+# 抖音对部分作品把整段 mp4 做成 CENC 加密（stsd 里是 encv/enca，带 sinf/schm/tenc），
+# 本地任何解码器都会 avcodec_send_packet 报 InvalidDataError。浏览器侧有密钥能播，
+# 但 headless Chrome 的 captureStream/MediaRecorder 实测只录到静音（8 秒 2KB、转写为空），
+# 所以这类作品必须在下载后立刻识别并跳过，不浪费转写时间、也不每轮重下 39MB。
+DRM_TAGS = (b"encv", b"enca", b"sinf", b"tenc", b"schm")
+
+
+def _drm_encrypted(p: Path, head_bytes: int = 2_000_000) -> list:
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(head_bytes)
+    except OSError:
+        return []
+    return [t.decode() for t in DRM_TAGS if t in head]
+
+
 def _valid_audio(p: Path) -> bool:
     try:
         if p.stat().st_size < MIN_BYTES:
@@ -132,25 +147,42 @@ def _valid_audio(p: Path) -> bool:
         return False
 
 
-def fetch_audio(aweme_id: str, out_dir: Path, bind: str = "", wait_ms: int = 18000,
+def fetch_audio(aweme_id: str, out_dir: Path, bind: str = "", wait_ms: int = 24000,
                 force: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     dst = out_dir / f"{aweme_id}.m4a"
-    if not force and _valid_audio(dst):
-        return {"ok": True, "aweme_id": aweme_id, "path": str(dst),
-                "bytes": dst.stat().st_size, "kind": "audio", "cached": True}
+    dst_mp4 = out_dir / f"{aweme_id}.mp4"
+    if not force:
+        for cand, kind in ((dst, "audio"), (dst_mp4, "video")):
+            if _valid_audio(cand):
+                return {"ok": True, "aweme_id": aweme_id, "path": str(cand),
+                        "bytes": cand.stat().st_size, "kind": kind, "cached": True}
 
     g = grab_streams(aweme_id, wait_ms=wait_ms)
     if not g.get("ok"):
         return {"ok": False, "aweme_id": aweme_id, "error": f"抓不到媒体流: {g.get('error') or '无 audio/video 请求'}"}
     title = re.sub(r"\s*-\s*抖音\s*$", "", (g.get("title") or "").strip())
-    urls = g.get("audio") or []
-    if not urls:
-        return {"ok": False, "aweme_id": aweme_id, "error": "页面加载了但没有 media-audio 音轨请求",
-                "video_count": len(g.get("video") or []), "title": title}
+
+    # 三种形态，按「越适合转写越靠前」排：
+    #  1) media-audio 的 DASH 音轨（AAC，几百 KB 到几 MB）—— 首选
+    #  2) 整段 mp4（/video/tos/…&mime_type=video_mp4 单文件，含 h264+aac）—— 没有拆分流的作品走这条
+    #  3) media-video 的 DASH 视频轨（HEVC，通常无音轨）—— 最后才试，失败概率高
+    plan: list[tuple[str, str, Path]] = []
+    for u in (g.get("audio") or [])[:2]:
+        plan.append((u, "audio", dst))
+    for u in (g.get("other") or [])[:2]:
+        plan.append((u, "video", dst_mp4))
+    for u in (g.get("video") or [])[:1]:
+        plan.append((u, "video", dst_mp4))
+    if not plan:
+        return {"ok": False, "aweme_id": aweme_id,
+                "error": "页面加载了但没有抓到任何媒体流请求",
+                "counts": {"audio": len(g.get("audio") or []),
+                           "video": len(g.get("video") or []),
+                           "other": len(g.get("other") or [])}, "title": title}
 
     errors: list[str] = []
-    for url in urls[:2]:
+    for url, kind, dst_path in plan:
         for bind_addr in ([bind] if bind else ["", "192.168.1.4"]):
             sess = _session(bind_addr)
             try:
@@ -167,18 +199,26 @@ def fetch_audio(aweme_id: str, out_dir: Path, bind: str = "", wait_ms: int = 180
                                 n += len(chunk)
                         fh.flush()
                         os.fsync(fh.fileno())
-                    tmp.replace(dst)
-                if _valid_audio(dst):
-                    return {"ok": True, "aweme_id": aweme_id, "path": str(dst), "bytes": n,
-                            "kind": "audio", "cached": False, "bind": bind_addr or "auto",
+                    tmp.replace(dst_path)
+                if _valid_audio(dst_path):
+                    tags = _drm_encrypted(dst_path)
+                    if len(tags) >= 2:
+                        dst_path.unlink(missing_ok=True)
+                        return {"ok": False, "aweme_id": aweme_id, "drm": True, "drm_tags": tags,
+                                "error": f"该作品是 DRM 加密的 mp4（{'/'.join(tags)}），本地解码器无法解，已跳过",
+                                "kind": kind, "title": title}
+                    return {"ok": True, "aweme_id": aweme_id, "path": str(dst_path), "bytes": n,
+                            "kind": kind, "cached": False, "bind": bind_addr or "auto",
                             "title": title}
-                errors.append(f"下载内容不是合法 m4a ({n}B) bind={bind_addr or 'auto'}")
-                dst.unlink(missing_ok=True)
+                errors.append(f"下载内容不是合法媒体文件 ({n}B) kind={kind} bind={bind_addr or 'auto'}")
+                dst_path.unlink(missing_ok=True)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{type(exc).__name__}: {exc} bind={bind_addr or 'auto'}")
             finally:
                 sess.close()
-    return {"ok": False, "aweme_id": aweme_id, "error": "音频轨全部失败", "errors": errors[:4]}
+    return {"ok": False, "aweme_id": aweme_id, "error": "媒体流全部失败", "errors": errors[:4],
+            "counts": {"audio": len(g.get("audio") or []), "video": len(g.get("video") or []),
+                       "other": len(g.get("other") or [])}}
 
 
 def main() -> int:

@@ -108,6 +108,10 @@ def download(aweme_id: str, out_dir: Path, bind: str = "", budget_ms: int = 2000
         ga = fetch_audio(aweme_id, out_dir, bind=bind, wait_ms=budget_ms, force=force)
         if ga.get("ok"):
             return ga
+        if ga.get("drm"):
+            # DRM（CENC）加密的作品：整段 mp4 解不了，旧路径也只会下到同一个加密文件，
+            # 直接上报，交给 run_once 标 unsupported，不重试、不浪费带宽。
+            return ga
         audio_err = ga.get("error") or "音频轨抓取失败"
     except Exception as exc:  # noqa: BLE001
         audio_err = f"音频轨异常 {type(exc).__name__}: {exc}"

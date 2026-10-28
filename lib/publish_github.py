@@ -54,6 +54,18 @@ def _run(argv: list, cwd: Path, timeout: int = 180) -> tuple:
         return 124, "超时 %ds: %s" % (timeout, " ".join(argv))
 
 
+def _blob_url(repo_dir: Path, posts_dir: Path, md_path: Path) -> str:
+    """拼出这条存档页在 GitHub 上的直达地址。"""
+    rc, out = _run(["git", "remote", "get-url", "origin"], repo_dir)
+    remote = out.strip() if rc == 0 else ""
+    if remote.endswith(".git"):
+        remote = remote[: -4]
+    if not remote:
+        return ""
+    from urllib.parse import quote as _q
+    return remote + "/blob/main/posts/" + _q(posts_dir.name) + "/" + _q(md_path.name)
+
+
 def _ssh_url(remote: str) -> str:
     """https://github.com/OWNER/REPO.git → git@github.com:OWNER/REPO.git"""
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", (remote or "").strip())
@@ -300,23 +312,34 @@ def main() -> int:
         return 1
 
     rc, _out = _run(["git", "diff", "--cached", "--quiet"], repo_dir)
-    if rc == 0:
+    rc_ahead, out_ahead = _run(["git", "rev-list", "--count", "origin/main..HEAD"], repo_dir)
+    ahead = int(out_ahead.strip()) if rc_ahead == 0 and out_ahead.strip().isdigit() else 0
+
+    if rc == 0 and ahead == 0:
         log("没有需要提交的变更")
-        result.update(ok=True, pushed=None, note="no change")
+        result.update(ok=True, pushed=None, note="no change",
+                      url=_blob_url(repo_dir, posts_dir, md_path))
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
-    msg = "add: %s %s (#%s)" % (day, (payload.get("title") or "无标题")[:50], sid)
-    rc, out = _run(["git", "-c", "user.name=douyin-monitor",
-                    "-c", "user.email=douyin-monitor@users.noreply.github.com",
-                    "commit", "-m", msg], repo_dir)
-    if rc != 0 and "nothing to commit" not in out:
-        result["error"] = "git commit 失败: " + out[-400:]
-        print(json.dumps(result, ensure_ascii=False))
-        return 1
-    rc2, out2 = _run(["git", "rev-parse", "--short", "HEAD"], repo_dir)
-    result["commit"] = out2.strip() if rc2 == 0 else None
-    log("提交 %s: %s" % (result["commit"], msg))
+    rc_h, out_h = _run(["git", "rev-parse", "--short", "HEAD"], repo_dir)
+    if rc == 0:
+        # 文件内容与上一轮一模一样，但本地还有没推上去的提交（上一次 push 失败）。
+        # 这种情况必须继续往下走推送，否则「本地有、远端没有」会被当成已发布。
+        log("无新变更，但有 %d 个提交待推送" % ahead)
+        result["commit"] = out_h.strip() if rc_h == 0 else None
+    else:
+        msg = "add: %s %s (#%s)" % (day, (payload.get("title") or "无标题")[:50], sid)
+        rc, out = _run(["git", "-c", "user.name=douyin-monitor",
+                        "-c", "user.email=douyin-monitor@users.noreply.github.com",
+                        "commit", "-m", msg], repo_dir)
+        if rc != 0 and "nothing to commit" not in out:
+            result["error"] = "git commit 失败: " + out[-400:]
+            print(json.dumps(result, ensure_ascii=False))
+            return 1
+        rc2, out2 = _run(["git", "rev-parse", "--short", "HEAD"], repo_dir)
+        result["commit"] = out2.strip() if rc2 == 0 else None
+        log("提交 %s: %s" % (result["commit"], msg))
 
     if a.no_push:
         result.update(ok=True, pushed=False, note="--no-push")
@@ -359,15 +382,7 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 1
 
-    rc, out2 = _run(["git", "remote", "get-url", "origin"], repo_dir)
-    remote = out2.strip()
-    for suf in (".git",):
-        if remote.endswith(suf):
-            remote = remote[: -len(suf)]
-    from urllib.parse import quote as _q
-    slug_dir = _q(posts_dir.name)
-    result.update(ok=True, pushed=True,
-                  url=(remote + "/blob/main/posts/" + slug_dir + "/" + _q(md_path.name)) if remote else None)
+    result.update(ok=True, pushed=True, url=_blob_url(repo_dir, posts_dir, md_path) or None)
     log("push 完成")
     print(json.dumps(result, ensure_ascii=False))
     return 0
