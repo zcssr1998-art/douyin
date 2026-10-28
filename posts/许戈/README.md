@@ -1,5 +1,7 @@
 # 许戈 · 短视频存档
 
+主页：<https://www.douyin.com/user/MS4wLjABAAAAL2jRNiLiY47VEMMmhSL2XBm9aF7D6mU0Js6TMe90Z4U>
+
 每条视频一个 markdown：本地语音转写的逐字稿 + 五段式观点分析。
 视频可能随时被平台下架，这里是下架前的存档。
 
