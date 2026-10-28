@@ -215,6 +215,9 @@ def notify_payload(item: dict, analysis: dict) -> dict:
         "title": item.get("title") or "",
         "publish_time": item.get("published_at") or "",
         "video_url": item.get("url") or f"https://www.douyin.com/video/{item['aweme_id']}",
+        # DRM 加密的作品没有逐字稿也没有分析，publish 端据此换一套文案，
+        # 而不是输出五个「模型未返回该字段」。
+        "drm": bool(item.get("drm")),
         "analysis": {
             "core": body.get("core", ""),
             "evidence": body.get("evidence", ""),

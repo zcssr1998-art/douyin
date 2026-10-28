@@ -20,6 +20,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,12 @@ def _run(argv: list, cwd: Path, timeout: int = 180) -> tuple:
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         return 124, "超时 %ds: %s" % (timeout, " ".join(argv))
+
+
+def _norm_md(text: str) -> str:
+    """比较 markdown 是否等价时忽略「抓取时间」行 —— 它每轮都不同，
+    否则同一条作品每跑一次就多一个 commit。"""
+    return re.sub(r"[|] 抓取时间 [|][^\n]*\n", "", text)
 
 
 def _blob_url(repo_dir: Path, posts_dir: Path, md_path: Path) -> str:
@@ -111,6 +118,7 @@ def build_markdown(payload: dict, transcript, media_name) -> str:
     url = (payload.get("video_url") or "").strip()
     day, shown = _fmt_publish(payload.get("publish_time") or "", sid)
     ana = payload.get("analysis") or {}
+    drm = bool(payload.get("drm"))
     fetched = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
 
     L = []
@@ -128,6 +136,19 @@ def build_markdown(payload: dict, transcript, media_name) -> str:
     L.append("")
     L.append("> 视频可能随时被平台下架，本文的逐字稿与音频是在线时抓取的存档。")
     L.append("")
+
+    if drm:
+        L.append("## 为什么这条没有逐字稿和观点分析")
+        L.append("")
+        L.append("这条作品的音频轨被 DRM（CENC，mp4 里的 encv / enca 加密框）保护，"
+                 "本地解码器解不开、拿不到声音，因此无法转写成文字，也就没有 AI 观点分析。"
+                 "本页只保留标题、发布时间与原始链接，作用是作者删片后仍留一条可追溯的时间戳记录。")
+        L.append("")
+        L.append("## 逐字稿（语音转写全文）")
+        L.append("")
+        L.append("_（媒体被 DRM 加密，无法转写）_")
+        L.append("")
+        return "\n".join(L)
 
     for key, heading in SECTIONS:
         body = (ana.get(key) or "").strip()
@@ -279,7 +300,7 @@ def main() -> int:
     md_path = posts_dir / ("%s-%s-%s.md" % (day, sid, slug))
     md = build_markdown(payload, transcript, media_name)
     changed = True
-    if md_path.exists() and md_path.read_text(encoding="utf-8") == md:
+    if md_path.exists() and _norm_md(md_path.read_text(encoding="utf-8")) == _norm_md(md):
         changed = False
         log("markdown 无变化: %s" % md_path.name)
     else:
@@ -348,12 +369,14 @@ def main() -> int:
 
     # 本机 git 默认凭据助手是 Git Credential Manager，无人值守时会挂在弹窗上不返回；
     # 显式改用 gh 的凭据助手（token 存在系统 keyring 里，不落盘、不进日志）。
+    # 每一级都必须限时：GitHub 的 https 通道时通时断，凭据助手在无人值守时会挂住，
+    # 600 秒超时会把整轮监控卡死（实测把 run_once 拖到 10 分钟以上）。
     rc, out = _run(["git", "-c", "credential.helper=",
                     "-c", "credential.helper=!gh auth git-credential",
-                    "push", "origin", "HEAD:main"], repo_dir, timeout=600)
+                    "push", "origin", "HEAD:main"], repo_dir, timeout=120)
     if rc != 0:
-        # 兜底一：普通 https push（系统凭据助手）
-        rc, out2 = _run(["git", "push", "origin", "HEAD:main"], repo_dir, timeout=600)
+        # 兜底一：普通 https push（系统凭据助手，GCM_INTERACTIVE=never 已在 _run 里设好）
+        rc, out2 = _run(["git", "push", "origin", "HEAD:main"], repo_dir, timeout=120)
         if rc == 0:
             out = out2
 
@@ -373,7 +396,7 @@ def main() -> int:
             if label == "443":
                 env["GIT_SSH_COMMAND"] = "ssh -p 443 " + " ".join(ssh_args)
             log("https 推送失败，改走 SSH(%s): %s" % (label, target))
-            rc, out = _run(argv, repo_dir, timeout=600, extra_env=env)
+            rc, out = _run(argv, repo_dir, timeout=120, extra_env=env)
             if rc == 0:
                 break
 
@@ -382,6 +405,10 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 1
 
+    # 推送成功后同步本地 origin/main 引用：push 到的是直接 URL（SSH），
+    # 不走 origin 配置，refs/remotes/origin/main 不会自动前进，
+    # 不手动更新下一轮会误判成「还有提交待推」，白跑一次网络超时。
+    _run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], repo_dir)
     result.update(ok=True, pushed=True, url=_blob_url(repo_dir, posts_dir, md_path) or None)
     log("push 完成")
     print(json.dumps(result, ensure_ascii=False))
