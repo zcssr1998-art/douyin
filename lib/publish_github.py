@@ -54,6 +54,20 @@ def _run(argv: list, cwd: Path, timeout: int = 180) -> tuple:
         return 124, "超时 %ds: %s" % (timeout, " ".join(argv))
 
 
+def _ssh_url(remote: str) -> str:
+    """https://github.com/OWNER/REPO.git → git@github.com:OWNER/REPO.git"""
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", (remote or "").strip())
+    if not m:
+        return ""
+    return "git@github.com:%s/%s.git" % (m.group(1), m.group(2))
+
+
+def _ssh_url443(remote: str) -> str:
+    """同 _ssh_url，但指向 ssh.github.com（配合 -p 443 使用）。"""
+    u = _ssh_url(remote)
+    return u.replace("git@github.com:", "git@ssh.github.com:", 1) if u else ""
+
+
 def _slug_title(title: str, limit: int = 60) -> str:
     t = (title or "").replace("\r", " ").replace("\n", " ")
     # 标题里 "#话题 #标签" 对文件名没意义，截到第一个话题标签之前
@@ -315,9 +329,31 @@ def main() -> int:
                     "-c", "credential.helper=!gh auth git-credential",
                     "push", "origin", "HEAD:main"], repo_dir, timeout=600)
     if rc != 0:
+        # 兜底一：普通 https push（系统凭据助手）
         rc, out2 = _run(["git", "push", "origin", "HEAD:main"], repo_dir, timeout=600)
         if rc == 0:
             out = out2
+
+    if rc != 0:
+        # 兜底二：走 SSH。github.com:443 被网络阻断时 SSH 通道仍然可用
+        #（实测 github.com:22 与 ssh.github.com:443 都能认证），用已配置的 SSH key 推，
+        # 避免 https 整条通道不可达导致内容永远上不去。
+        rc0, out0 = _run(["git", "remote", "get-url", "origin"], repo_dir)
+        url = out0.strip() if rc0 == 0 else ""
+        ssh_args = ["-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=25"]
+        for label, target in (("22", _ssh_url(url)), ("443", _ssh_url443(url))):
+            if not target:
+                continue
+            env = {"GIT_SSH_COMMAND": "ssh " + " ".join(ssh_args)}
+            argv = ["git", "push", target, "HEAD:main"]
+            if label == "443":
+                env["GIT_SSH_COMMAND"] = "ssh -p 443 " + " ".join(ssh_args)
+            log("https 推送失败，改走 SSH(%s): %s" % (label, target))
+            rc, out = _run(argv, repo_dir, timeout=600, extra_env=env)
+            if rc == 0:
+                break
+
     if rc != 0:
         result["error"] = "git push 失败（commit 已落地，下一轮重试）: " + out[-400:]
         print(json.dumps(result, ensure_ascii=False))
