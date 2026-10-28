@@ -138,12 +138,27 @@ def load_config() -> dict:
         return json.load(fh)
 
 
-def state_path(cfg: dict) -> Path:
+def users(cfg: dict) -> list[dict]:
+    """监控名单。优先用 cfg["users"] 数组；没有就退回单个 cfg["user"]（旧配置兼容）。"""
+    us = cfg.get("users")
+    if isinstance(us, list) and us:
+        out = [u for u in us if isinstance(u, dict) and u.get("sec_uid")]
+        if out:
+            return out
+    u = cfg.get("user") or {}
+    return [u] if u.get("sec_uid") else []
+
+
+def state_path(cfg: dict, user: dict | None = None) -> Path:
+    """每个博主一个 state 文件，避免多账号互相覆盖名单。"""
+    uid = (user or {}).get("sec_uid") if user else None
+    if uid:
+        return ROOT / "data" / "state" / (str(uid) + ".json")
     return ROOT / cfg["paths"]["state"]
 
 
-def load_state(cfg: dict) -> dict:
-    p = state_path(cfg)
+def load_state(cfg: dict, user: dict | None = None) -> dict:
+    p = state_path(cfg, user)
     if p.exists():
         try:
             with open(p, encoding="utf-8") as fh:
@@ -155,8 +170,8 @@ def load_state(cfg: dict) -> dict:
     return {"version": 1, "baseline_at": None, "items": {}}
 
 
-def save_state(cfg: dict, st: dict) -> None:
-    p = state_path(cfg)
+def save_state(cfg: dict, st: dict, user: dict | None = None) -> None:
+    p = state_path(cfg, user)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -296,6 +311,10 @@ def advance(item: dict, cfg: dict) -> dict:
                 argv += ["--media", item["media"]]
             if item.get("transcript"):
                 argv += ["--transcript", item["transcript"]]
+            if item.get("nickname"):
+                argv += ["--author", item["nickname"]]
+            if item.get("profile_url"):
+                argv += ["--profile-url", item["profile_url"]]
             if pub.get("repo_dir"):
                 argv += ["--repo-dir", str(pub["repo_dir"])]
             if pub.get("push") is False:
@@ -328,14 +347,16 @@ def advance(item: dict, cfg: dict) -> dict:
     return item
 
 
-def build_item(raw: dict, cfg: dict) -> dict:
+def build_item(raw: dict, cfg: dict, user: dict | None = None) -> dict:
+    u = user or (cfg.get("user") or {})
     return {
         "aweme_id": raw["aweme_id"],
         "ts": raw.get("ts") or _id_ts(raw["aweme_id"]),
         "title": raw.get("title") or "",
         "published_at": raw.get("published_at") or _iso_from_ts(_id_ts(raw["aweme_id"])),
         "url": raw.get("url") or f"https://www.douyin.com/video/{raw['aweme_id']}",
-        "nickname": (cfg.get("user") or {}).get("nickname", ""),
+        "nickname": u.get("nickname", ""),
+        "profile_url": u.get("profile_url", ""),
         "stage": "discovered",
         "first_seen": now_iso(),
         "attempts": 0,
@@ -354,18 +375,23 @@ def main() -> int:
     ap.add_argument("--status", action="store_true", help="只打印 state 概况")
     ap.add_argument("--max-items", type=int, default=0)
     ap.add_argument("--no-fetch", action="store_true", help="不拉列表，只推进已记录作品的未完成阶段")
+    ap.add_argument("--only-user", default="", help="只处理指定博主（昵称或 sec_uid），用于单账号验证")
     a = ap.parse_args()
 
     cfg = load_config()
 
     if a.status:
-        st = load_state(cfg)
-        items = st.get("items", {})
-        by_stage: dict[str, int] = {}
-        for it in items.values():
-            by_stage[it.get("stage", "?")] = by_stage.get(it.get("stage", "?"), 0) + 1
-        print(json.dumps({"ok": True, "baseline_at": st.get("baseline_at"), "total": len(items),
-                          "by_stage": by_stage}, ensure_ascii=False))
+        rows = []
+        for u in users(cfg):
+            st = load_state(cfg, u)
+            items = st.get("items", {})
+            by_stage: dict[str, int] = {}
+            for it in items.values():
+                by_stage[it.get("stage", "?")] = by_stage.get(it.get("stage", "?"), 0) + 1
+            rows.append({"nickname": u.get("nickname"), "sec_uid": u.get("sec_uid"),
+                         "baseline_at": st.get("baseline_at"), "total": len(items),
+                         "by_stage": by_stage})
+        print(json.dumps({"ok": True, "users": rows}, ensure_ascii=False))
         return 0
 
     if not acquire_run_lock():
@@ -377,28 +403,27 @@ def main() -> int:
         release_run_lock()
 
 
-def _main_locked(a, cfg) -> int:
-    st = load_state(cfg)
-
-    summary: dict = {"ok": True, "started_at": now_iso(), "new": [], "advanced": [], "errors": []}
+def _run_user(a, cfg: dict, user: dict, summary: dict) -> int:
+    """处理一位博主：拉列表 → 建基线/识别新作品 → 推进未完成阶段。"""
+    st = load_state(cfg, user)
+    nick = (user.get("nickname") or "").strip()
 
     # ---- 1) 拉列表 ----
     feed: dict = {"ok": False, "error": "skipped"}
     if not a.no_fetch:
         import fetch_feed  # noqa: E402
         try:
-            feed = fetch_feed.fetch(cfg["user"]["sec_uid"],
+            feed = fetch_feed.fetch(user["sec_uid"],
                                     budget_ms=cfg["fetch"].get("budget_ms", 25000),
-                                    expect_nickname=(cfg.get("user") or {}).get("nickname", ""))
+                                    expect_nickname=nick)
         except Exception as exc:  # noqa: BLE001
             feed = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         summary["feed"] = {"ok": feed.get("ok"), "count": feed.get("count"), "error": feed.get("error")}
         if not feed.get("ok"):
             log(f"列表拉取失败: {feed.get('error')}")
             st["last_fetch_error"] = {"at": now_iso(), "error": feed.get("error")}
-            save_state(cfg, st)
+            save_state(cfg, st, user)
             summary["ok"] = False
-            print(json.dumps(summary, ensure_ascii=False))
             return 0  # 单次失败不当作致命，交给下一轮
         st.pop("last_fetch_error", None)
         st["prev_fetch_at"] = st.get("last_fetch_at")
@@ -408,13 +433,12 @@ def _main_locked(a, cfg) -> int:
     items = st.setdefault("items", {})
     if feed.get("ok") and not st.get("baseline_at"):
         for raw in feed["items"]:
-            items[raw["aweme_id"]] = {**build_item(raw, cfg), "stage": "baseline"}
+            items[raw["aweme_id"]] = {**build_item(raw, cfg, user), "stage": "baseline"}
         st["baseline_at"] = now_iso()
         st["user"] = feed.get("user")
-        save_state(cfg, st)
+        save_state(cfg, st, user)
         summary["baseline"] = {"created_at": st["baseline_at"], "seeded": len(feed["items"])}
-        log(f"已建立基线，共 {len(feed['items'])} 条历史作品（不推送）")
-        print(json.dumps(summary, ensure_ascii=False))
+        log(f"{nick} 已建立基线，共 {len(feed['items'])} 条历史作品（不推送）")
         return 0
 
     if a.simulate_new:
@@ -430,7 +454,7 @@ def _main_locked(a, cfg) -> int:
         keep_keys = ("title", "published_at", "media", "media_bytes", "transcript",
                      "transcript_chars", "incomplete", "analysis")
         keep = {k: old[k] for k in keep_keys if old.get(k)}
-        items[sid] = {**build_item(meta, cfg), **keep, "simulated": True,
+        items[sid] = {**build_item(meta, cfg, user), **keep, "simulated": True,
                       "first_seen": old.get("first_seen") or now_iso()}
         log(f"模拟新作品: {sid}（stage 重置为 discovered）")
         summary["simulated"] = sid
@@ -449,16 +473,16 @@ def _main_locked(a, cfg) -> int:
                 stale.append(raw)
         # 抓取窗口抖动会露出未记录的老卡片：补进基线，绝不当新作品推送
         for raw in stale:
-            items[raw["aweme_id"]] = {**build_item(raw, cfg), "stage": "baseline"}
+            items[raw["aweme_id"]] = {**build_item(raw, cfg, user), "stage": "baseline"}
             log(f"补录历史作品 {raw['aweme_id']} {raw.get('published_at')}（早于监控起点，不推送）")
         summary["backfilled"] = [r["aweme_id"] for r in stale]
         fresh.sort(key=lambda r: r["ts"])  # 旧→新
         for raw in fresh:
-            items[raw["aweme_id"]] = build_item(raw, cfg)
+            items[raw["aweme_id"]] = build_item(raw, cfg, user)
             summary["new"].append(raw["aweme_id"])
             log(f"发现新作品 {raw['aweme_id']} {raw.get('published_at')} {raw.get('title')[:30]}")
         if fresh or stale:
-            save_state(cfg, st)
+            save_state(cfg, st, user)
 
     # ---- 3) 推进未完成阶段 ----
     max_items = a.max_items or cfg["poll"].get("max_items_per_run", 3)
@@ -476,13 +500,13 @@ def _main_locked(a, cfg) -> int:
                 it["stage_prev"] = it.get("stage")
                 it["stage"] = "failed"
                 log(f"{it['aweme_id']} 超过 {max_attempts} 次重试，标 failed")
-                save_state(cfg, st)
+                save_state(cfg, st, user)
             continue
         cur = it
         for _ in range(5):  # 一条作品一次调用里可以连推多阶段，最多 5 跳
             nxt = advance(cur, cfg)
             items[cur["aweme_id"]] = nxt
-            save_state(cfg, st)
+            save_state(cfg, st, user)
             if nxt.get("dry_run"):
                 summary.setdefault("dry_run", []).append(cur["aweme_id"])
                 log(f"{cur['aweme_id']} 已分析完成，缺 Discord 凭据 → 落盘 outbox 待补发")
@@ -503,8 +527,39 @@ def _main_locked(a, cfg) -> int:
     summary["totals"] = {"tracked": len(items),
                          "notified": sum(1 for x in items.values() if x.get("stage") == "notified"),
                          "failed": sum(1 for x in items.values() if x.get("stage") == "failed")}
+    save_state(cfg, st, user)
+    return 0
+
+
+def _main_locked(a, cfg) -> int:
+    """多博主入口：逐个博主跑一遍，互不干扰。"""
+    summary: dict = {"ok": True, "started_at": now_iso(), "new": [], "advanced": [],
+                     "errors": [], "per_user": {}}
+    targets = users(cfg)
+    only = (getattr(a, "only_user", "") or "").strip()
+    if only:
+        targets = [u for u in targets
+                   if only in ((u.get("nickname") or ""), (u.get("sec_uid") or ""))]
+        if not targets:
+            print(json.dumps({"ok": False, "error": f"没有匹配的博主: {only}"}, ensure_ascii=False))
+            return 1
+    for user in targets:
+        nick = (user.get("nickname") or user.get("sec_uid") or "?")
+        sub: dict = {"nickname": nick, "sec_uid": user.get("sec_uid"),
+                     "new": [], "advanced": [], "errors": []}
+        try:
+            _run_user(a, cfg, user, sub)
+        except Exception as exc:  # noqa: BLE001
+            sub["error"] = f"{type(exc).__name__}: {exc}"
+            sub["ok"] = False
+            log(f"{nick} 处理异常: {sub['error']}")
+        summary["new"] += sub.get("new") or []
+        summary["advanced"] += sub.get("advanced") or []
+        summary["errors"] += sub.get("errors") or []
+        if sub.get("ok") is False:
+            summary["ok"] = False
+        summary["per_user"][nick] = sub
     summary["finished_at"] = now_iso()
-    save_state(cfg, st)
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 

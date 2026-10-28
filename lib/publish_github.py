@@ -130,8 +130,17 @@ def build_markdown(payload: dict, transcript, media_name) -> str:
     return "\n".join(L)
 
 
-def update_index(posts_dir: Path) -> str:
-    """重建 posts/README.md 索引表：按文件名（日期-ID）倒序。"""
+def _slug_author(name: str) -> str:
+    """博主昵称转目录名：去掉文件系统非法字符与空白，避免 posts/ 下出现怪目录。"""
+    t = (name or "").strip()
+    for ch in '\\/:*?"<>|\r\n\t':
+        t = t.replace(ch, " ")
+    t = " ".join(t.split())
+    return t or "unknown"
+
+
+def update_index(posts_dir: Path, author: str = "", profile_url: str = "") -> str:
+    """重建某个博主目录下的 README.md 索引表：按文件名（日期-ID）倒序。"""
     rows = []
     for md in sorted(posts_dir.glob("*.md")):
         if md.name.lower() == "readme.md":
@@ -150,17 +159,42 @@ def update_index(posts_dir: Path) -> str:
         rows.append((md.name, shown, title))
     rows.sort(key=lambda r: r[0], reverse=True)
 
-    L = ["# 抖音博主更新存档", "",
-         "监控对象：**艾丽的无废话财经**（抖音号 606890417）",
-         "主页：https://www.douyin.com/user/MS4wLjABAAAA_hkYGrUP3d2i3JodCLwrplan05tJ9xl1D6lZySbNC0Q", "",
-         "每条视频一个 markdown：本地语音转写的逐字稿 + 五段式观点分析 + 音频存档。",
-         "视频可能随时被平台下架，这里是下架前的存档。", "",
-         "| 发布时间 | 标题 | 文件 |", "|---|---|---|"]
+    L = ["# %s · 短视频存档" % (author or "博主"), ""]
+    if profile_url:
+        L += ["主页：<%s>" % profile_url, ""]
+    L += ["每条视频一个 markdown：本地语音转写的逐字稿 + 五段式观点分析。",
+          "视频可能随时被平台下架，这里是下架前的存档。", "",
+          "| 发布时间 | 标题 | 文件 |", "|---|---|---|"]
     for name, shown, title in rows:
         safe = title.replace("|", "\\|")
         L.append("| %s | %s | [%s](%s) |" % (shown, safe, name, name))
     L.append("")
     L.append("共 %d 条。由自动监控脚本生成，每 3 分钟检查一次是否更新。" % len(rows))
+    L.append("")
+    return "\n".join(L)
+
+
+def update_root_index(repo_dir: Path) -> str:
+    """重建 posts/README.md 总索引：列出每位博主的目录与条数。"""
+    posts = repo_dir / "posts"
+    from urllib.parse import quote as _q
+    rows = []
+    for d in sorted(posts.iterdir() if posts.exists() else []):
+        if not d.is_dir() or d.name == "media":
+            continue
+        n = len([p for p in d.glob("*.md") if p.name.lower() != "readme.md"])
+        if n:
+            rows.append((n, d.name))
+    rows.sort(key=lambda x: (-x[0], x[1]))
+    L = ["# 抖音博主更新存档", "",
+         "自动监控若干抖音博主。每条新视频生成一篇 markdown：本地语音转写的逐字稿 + 五段式观点分析。",
+         "视频可能随时被平台下架，这里是下架前的存档。", "",
+         "| 博主 | 条数 | 目录 |", "|---|---|---|"]
+    for n, name in rows:
+        L.append("| %s | %d | [%s](%s/README.md) |" % (name, n, name, _q(name)))
+    L.append("")
+    L.append("共 %d 位博主、%d 条。由自动监控脚本生成，默认每 3 分钟检查一次。"
+             % (len(rows), sum(r[0] for r in rows)))
     L.append("")
     return "\n".join(L)
 
@@ -178,6 +212,8 @@ def main() -> int:
     ap.add_argument("--repo-dir", default=None)
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--no-media", action="store_true")
+    ap.add_argument("--author", default="", help="博主昵称，用作 posts/ 下的子目录名")
+    ap.add_argument("--profile-url", default="", help="博主主页地址，写进该目录的索引头部")
     a = ap.parse_args()
 
     repo_dir = Path(a.repo_dir).resolve() if a.repo_dir else ROOT
@@ -194,8 +230,9 @@ def main() -> int:
         except Exception as exc:
             log("逐字稿读取失败，仍继续: %s" % exc)
 
-    posts_dir = repo_dir / "posts"
-    media_dir = posts_dir / "media"
+    author = (a.author or "").strip() or (payload.get("nickname") or "").strip()
+    posts_dir = repo_dir / "posts" / _slug_author(author)
+    media_dir = repo_dir / "posts" / "media"
     posts_dir.mkdir(parents=True, exist_ok=True)
 
     media_name = None
@@ -224,13 +261,20 @@ def main() -> int:
         log("写入 %s（%d 字符）" % (md_path.name, len(md)))
 
     idx = posts_dir / "README.md"
-    idx_text = update_index(posts_dir)
+    idx_text = update_index(posts_dir, author, a.profile_url)
     if not idx.exists() or idx.read_text(encoding="utf-8") != idx_text:
         idx.write_text(idx_text, encoding="utf-8")
         changed = True
-        log("更新索引 posts/README.md")
+        log("更新索引 %s/README.md" % posts_dir.name)
 
-    rel = str(posts_dir.relative_to(repo_dir))
+    root_idx = repo_dir / "posts" / "README.md"
+    root_text = update_root_index(repo_dir)
+    if not root_idx.exists() or root_idx.read_text(encoding="utf-8") != root_text:
+        root_idx.write_text(root_text, encoding="utf-8")
+        changed = True
+        log("更新总索引 posts/README.md")
+
+    rel = "posts"
     result = {"ok": False, "aweme_id": sid,
               "files": [str(md_path.relative_to(repo_dir))],
               "commit": None, "pushed": False, "url": None}
@@ -284,8 +328,10 @@ def main() -> int:
     for suf in (".git",):
         if remote.endswith(suf):
             remote = remote[: -len(suf)]
+    from urllib.parse import quote as _q
+    slug_dir = _q(posts_dir.name)
     result.update(ok=True, pushed=True,
-                  url=(remote + "/blob/main/posts/" + md_path.name) if remote else None)
+                  url=(remote + "/blob/main/posts/" + slug_dir + "/" + _q(md_path.name)) if remote else None)
     log("push 完成")
     print(json.dumps(result, ensure_ascii=False))
     return 0
